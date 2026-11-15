@@ -39,11 +39,15 @@ def disable_telemetry(monkeypatch):
     monkeypatch.setattr(server_config, "disable_community_telemetry", True, raising=False)
 
 
-@pytest.fixture
-def http_app(monkeypatch):
-    """Build the streamable-HTTP app in CI mode without leaking settings to other tests."""
+@pytest.fixture(params=[True, False], ids=["json", "sse"])
+def http_app(request, monkeypatch):
+    """Build the streamable-HTTP app in CI mode without leaking settings to other tests.
+
+    Covers both response modes: JSON, and SSE, which is the production default
+    (``dev_json_response`` is False).
+    """
     monkeypatch.setattr(mcp.settings, "stateless_http", True, raising=False)
-    monkeypatch.setattr(mcp.settings, "json_response", True, raising=False)
+    monkeypatch.setattr(mcp.settings, "json_response", request.param, raising=False)
     monkeypatch.setattr(
         mcp.settings,
         "transport_security",
@@ -57,6 +61,19 @@ def http_app(monkeypatch):
     return mcp.streamable_http_app()
 
 
+def _jsonrpc_payload(response):
+    """Return the JSON-RPC message from a JSON body or from an SSE ``message`` event."""
+    if not response.headers.get("content-type", "").startswith("text/event-stream"):
+        return json.loads(response.text)
+    for event in response.text.replace("\r\n", "\n").split("\n\n"):
+        lines = event.split("\n")
+        if "event: message" not in lines:
+            continue
+        data = "\n".join(line[len("data:") :].lstrip() for line in lines if line.startswith("data:"))
+        return json.loads(data)
+    raise AssertionError(f"no SSE message event in the response: {response.text!r}")
+
+
 def test_mcp_handshake_returns_result(http_app):
     """A raw initialize over the streamable-HTTP endpoint must yield a JSON-RPC result."""
     with TestClient(http_app) as client:
@@ -66,6 +83,6 @@ def test_mcp_handshake_returns_result(http_app):
     assert response.text.strip(), (
         "MCP endpoint returned an empty body for a raw initialize request (observed externally as NO_RESPONSE)"
     )
-    body = json.loads(response.text)
+    body = _jsonrpc_payload(response)
     assert "result" in body, f"initialize did not return a JSON-RPC result: {body}"
     assert body["result"].get("serverInfo"), body
